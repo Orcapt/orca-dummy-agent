@@ -169,7 +169,7 @@ async def _execute_generate_image(
         
         # Wait 5 seconds to simulate image generation process
         logger.info("⏳ [DUMMY MODE] Waiting 5 seconds to simulate image generation...")
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
         
         # Generate the dummy image URL
         image_url = await generate_image_with_dalle(
