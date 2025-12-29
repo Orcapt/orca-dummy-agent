@@ -177,3 +177,5 @@ yarn-error.log*
 
 # Project specific
 photo_cat.png
+
+orca_venv/

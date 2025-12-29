@@ -1,0 +1,5 @@
+orcapt-sdk>=1.0.4
+openai==1.109.1
+fastapi==0.117.1
+mangum>=0.17.0
+boto3>=1.34.0

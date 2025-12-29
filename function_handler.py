@@ -9,18 +9,16 @@ Key Features:
 - DALL-E 3 image generation function
 - Function schema definitions
 - Function execution and error handling
-- Streaming progress updates to Lexia
+- Streaming progress updates via Orca Session
 
-Author: Lexia Team
+Author: Orca Team
 License: MIT
 """
-
+from typing import Tuple, Optional, Callable, Dict
 import asyncio
 import logging
-import os
 import json
-from openai import OpenAI
-from lexia import Variables
+from orca import Variables
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -58,199 +56,377 @@ AVAILABLE_FUNCTIONS = [
                 "required": ["prompt"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_video",
+            "description": "Send a video or YouTube link to the user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Video URL"},
+                    "is_youtube": {"type": "boolean", "description": "Whether it's a YouTube link"}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_audio",
+            "description": "Send one or more audio tracks to the user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Audio URL"},
+                    "label": {"type": "string", "description": "Track label"},
+                    "mime_type": {"type": "string", "description": "MIME type (e.g. audio/mp3)"}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_location",
+            "description": "Send a map location to the user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number", "description": "Latitude"},
+                    "lng": {"type": "number", "description": "Longitude"},
+                    "label": {"type": "string", "description": "Location description"}
+                },
+                "required": ["lat", "lng"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_trace",
+            "description": "Send a debug/internal trace message (not visible to end-users unless explicitly allowed)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Trace content"},
+                    "visibility": {"type": "string", "enum": ["all", "admin"], "default": "all"}
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_buttons",
+            "description": "Send a block of interactive buttons to the user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "buttons": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["link", "action"]},
+                                "label": {"type": "string"},
+                                "value": {"type": "string", "description": "URL for link, ID for action"},
+                                "color": {"type": "string", "description": "primary, destructive, etc."},
+                                "row": {"type": "integer"}
+                            },
+                            "required": ["type", "label", "value"]
+                        }
+                    }
+                },
+                "required": ["buttons"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_card_list",
+            "description": "Send a list of visual cards to the user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cards": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "photo": {"type": "string", "description": "Image URL"},
+                                "header": {"type": "string", "description": "Title"},
+                                "subheader": {"type": "string", "description": "Description"},
+                                "text": {"type": "string", "description": "Additional text"}
+                            }
+                        }
+                    }
+                },
+                "required": ["cards"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "track_usage",
+            "description": "Track token usage for the current request",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tokens": {"type": "integer", "description": "Number of tokens"},
+                    "token_type": {"type": "string", "enum": ["prompt", "completion", "total"]},
+                    "cost": {"type": "string", "description": "Optional cost (e.g. '$0.002')"},
+                    "label": {"type": "string", "description": "Optional label"}
+                },
+                "required": ["tokens", "token_type"]
+            }
+        }
     }
 ]
 
+
+# =========================
+# Helpers
+# =========================
+
+def _parse_args(function_call: dict) -> dict:
+    return json.loads(function_call["function"]["arguments"])
+
+
+async def _run_with_loading(session, key: str, coro, min_delay: float = 1.5):
+    """
+    Run a coroutine with a loading indicator and ensure it's visible for at least min_delay.
+    """
+    session.loading.start(key)
+    start_time = asyncio.get_event_loop().time()
+    try:
+        result = await coro
+        # Calculate how much longer we need to wait to hit the min_delay
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed < min_delay:
+            await asyncio.sleep(min_delay - elapsed)
+        return result
+    finally:
+        session.loading.end(key)
+
+
+def _fail(fn_name: str, error: Exception):
+    msg = f"Error executing function `{fn_name}`: {error}"
+    logger.error(msg, exc_info=True)
+    return f"\n\n❌ **Function Execution Error:** {msg}", None
+
+
+# =========================
+# Dummy Image Generator
+# =========================
+
 async def generate_image_with_dalle(
-    prompt: str, 
-    variables: list = None,
-    size: str = "1024x1024", 
-    quality: str = "standard", 
-    style: str = "vivid"
+    prompt: str,
+    size: str = "1024x1024",
+    quality: str = "standard",
+    style: str = "vivid",
 ) -> str:
-    """
-    Generate a dummy image URL for testing purposes.
-    
-    This function simulates image generation by returning a fixed dummy image URL
-    instead of actually calling DALL-E 3. Perfect for testing and demonstration.
-    
-    Args:
-        prompt: Detailed text description of the image to generate (used for logging)
-        variables: List of variables containing API keys (not used in dummy mode)
-        size: Image dimensions (not used in dummy mode)
-        quality: Image quality (not used in dummy mode)
-        style: Image style (not used in dummy mode)
-    
-    Returns:
-        str: Fixed dummy image URL
-        
-    Example:
-        >>> image_url = await generate_image_with_dalle("A beautiful sunset")
-        >>> print(f"Dummy image URL: {image_url}")
-    """
-    try:
-        # Fixed dummy image URL for testing
-        dummy_image_url = "https://fsn1.your-objectstorage.com/lexia-production/demo/images/generated_1758945096.png?X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=TQUW1QDE6DNCEW3SSSMX%2F20250927%2Ffsn1%2Fs3%2Faws4_request&X-Amz-Date=20250927T035136Z&X-Amz-SignedHeaders=host&X-Amz-Expires=604800&X-Amz-Signature=b5a8cfa4c98f6efb302d53837468a3106e69a41d0acded2a6bfbb06a66e1f609"
-        
-        logger.info(f"🎨 [DUMMY MODE] Simulating image generation for prompt: {prompt}")
-        logger.info(f"🎨 [DUMMY MODE] Parameters - Size: {size}, Quality: {quality}, Style: {style}")
-        logger.info(f"✅ [DUMMY MODE] Returning fixed dummy image URL: {dummy_image_url}")
-        
-        return dummy_image_url
-        
-    except Exception as e:
-        error_msg = f"Error in dummy image generation: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        raise Exception(error_msg)
+    logger.info("🎨 [DUMMY] Generating image")
+    await asyncio.sleep(1)
+    return (
+        "https://fsn1.your-objectstorage.com/"
+        "lexia-production/demo/images/generated_1758945096.png"
+    )
 
-async def execute_function_call(
-    function_call: dict, 
-    lexia_handler, 
-    data
-) -> tuple[str, str]:
-    """
-    Execute a function call and return the result and any generated file URL.
-    
-    Args:
-        function_call: The function call object from OpenAI
-        lexia_handler: The Lexia handler instance for streaming updates
-        data: The original chat message data
-        
-    Returns:
-        tuple: (result_message, generated_file_url or None)
-    """
-    try:
-        function_name = function_call['function']['name']
-        logger.info(f"🔧 Processing function: {function_name}")
-        
-        # Stream generic function processing start to Lexia
-        processing_msg = f"\n⚙️ **Processing function:** {function_name}"
-        lexia_handler.stream_chunk(data, processing_msg)
-        
-        if function_name == "generate_image":
-            return await _execute_generate_image(function_call, lexia_handler, data)
-        else:
-            error_msg = f"Unknown function: {function_name}"
-            logger.error(error_msg)
-            return f"\n\n❌ **Function Error:** {error_msg}", None
-            
-    except Exception as e:
-        error_msg = f"Error executing function {function_call['function']['name']}: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        function_error = f"\n\n❌ **Function Execution Error:** {error_msg}"
-        return function_error, None
+# =========================
+# Handlers
+# =========================
 
-async def _execute_generate_image(
-    function_call: dict, 
-    lexia_handler, 
-    data
-) -> tuple[str, str]:
-    """
-    Execute the generate_image function specifically.
-    
-    Args:
-        function_call: The function call object from OpenAI
-        lexia_handler: The Lexia handler instance for streaming updates
-        data: The original chat message data
-        
-    Returns:
-        tuple: (result_message, generated_image_url)
-    """
+async def handle_generate_image(fc: dict, session):
+    args = _parse_args(fc)
+
+    session.stream("\n🚀 **Executing function:** generate_image (Dummy Mode)")
+
+    async def job():
+        return await generate_image_with_dalle(**args)
+
     try:
-        args = json.loads(function_call["function"]["arguments"])
-        logger.info(f"🎨 Executing DALL-E image generation with args: {args}")
-        
-        # Stream function execution start to Lexia
-        execution_msg = f"\n🚀 **Executing function:** generate_image (Dummy Mode)"
-        lexia_handler.stream_chunk(data, execution_msg)
-        
-        # Stream image generation start markdown
-        lexia_handler.stream_chunk(data, "[lexia.loading.image.start]")
-        
-        # Wait 5 seconds to simulate image generation process
-        logger.info("⏳ [DUMMY MODE] Waiting 5 seconds to simulate image generation...")
-        await asyncio.sleep(10)
-        
-        # Generate the dummy image URL
-        image_url = await generate_image_with_dalle(
-            prompt=args.get("prompt"),
-            variables=data.variables,
-            size=args.get("size", "1024x1024"),
-            quality=args.get("quality", "standard"),
-            style=args.get("style", "vivid")
+        image_url = await _run_with_loading(session, "generating", job())
+
+        session.image.send(image_url)
+
+        result = (
+            "\n\n🎨 **Dummy Image Generated Successfully!**\n\n"
+            f"**Prompt:** {args.get('prompt')}"
         )
-        
-        logger.info(f"✅ [DUMMY MODE] Image URL returned: {image_url}")
-        
-        # Stream image generation end markdown
-        lexia_handler.stream_chunk(data, "[lexia.loading.image.end]")
-        
-        # Stream function completion to Lexia
-        completion_msg = f"\n✅ **Function completed successfully:** generate_image (Dummy Mode)"
-        lexia_handler.stream_chunk(data, completion_msg)
-        
-        # Add image generation result to response
-        image_result = f"\n\n🎨 **Dummy Image Generated Successfully!**\n\n**Prompt:** {args.get('prompt')}\n**Image URL:** [lexia.image.start]{image_url}[lexia.image.end] \n\n*Demo image for testing purposes*"
-        
-        # Stream the image result to Lexia
-        lexia_handler.stream_chunk(data, image_result)
-        
-        logger.info(f"✅ Image generation completed: {image_url}")
-        
-        return image_result, image_url
-        
+        session.stream(result)
+
+        return result, image_url
+
     except Exception as e:
-        error_msg = f"Error executing generate_image function: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        function_error = f"\n\n❌ **Function Execution Error:** {error_msg}"
-        return function_error, None
+        return _fail("generate_image", e)
+
+
+async def handle_send_video(fc: dict, session):
+    args = _parse_args(fc)
+
+    async def job():
+        await asyncio.sleep(1)
+        return args["url"], args.get("is_youtube", False)
+
+    try:
+        url, is_youtube = await _run_with_loading(session, "video", job())
+
+        if is_youtube:
+            session.video.youtube(url)
+        else:
+            session.video.send(url)
+
+        return f"\n✅ Video sent: {url}", None
+
+    except Exception as e:
+        return _fail("send_video", e)
+
+
+async def handle_send_audio(fc: dict, session):
+    args = _parse_args(fc)
+
+    async def job():
+        await asyncio.sleep(1)
+        return args
+
+    try:
+        data = await _run_with_loading(session, "audio", job())
+
+        session.audio.send_single(
+            data["url"],
+            data.get("label"),
+            data.get("mime_type"),
+        )
+
+        return "\n✅ Audio sent", None
+
+    except Exception as e:
+        return _fail("send_audio", e)
+
+
+async def handle_send_location(fc: dict, session):
+    args = _parse_args(fc)
+
+    async def job():
+        await asyncio.sleep(1)
+        return args["lat"], args["lng"]
+
+    try:
+        lat, lng = await _run_with_loading(session, "map", job())
+        session.location.send_coordinates(lat, lng)
+        return "\n✅ Location sent", None
+
+    except Exception as e:
+        return _fail("send_location", e)
+
+
+async def handle_send_trace(fc: dict, session):
+    args = _parse_args(fc)
+    session.tracing.send(args["content"], args.get("visibility", "all"))
+    return "\n✅ Trace sent", None
+
+
+async def handle_send_buttons(fc: dict, session):
+    args = _parse_args(fc)
+
+    session.button.begin()
+    for b in args["buttons"]:
+        action = (
+            session.button.add_link
+            if b["type"] == "link"
+            else session.button.add_action
+        )
+        action(
+            b["label"],
+            b["value"],
+            row=b.get("row"),
+            color=b.get("color"),
+        )
+    session.button.end()
+
+    return "\n✅ Buttons sent", None
+
+
+async def handle_send_card_list(fc: dict, session):
+    args = _parse_args(fc)
+
+    async def job():
+        await asyncio.sleep(1)
+        return args["cards"]
+
+    try:
+        cards = await _run_with_loading(session, "card.list", job())
+        session.card.send(cards)
+        return "\n✅ Card list sent", None
+
+    except Exception as e:
+        return _fail("send_card_list", e)
+
+
+async def handle_track_usage(fc: dict, session):
+    args = _parse_args(fc)
+    session.usage.track(
+        args["tokens"],
+        args["token_type"],
+        cost=args.get("cost"),
+        label=args.get("label"),
+    )
+    return "\n✅ Usage tracked", None
+
+
+# =========================
+# Dispatcher
+# =========================
+
+FUNCTION_HANDLERS: Dict[str, Callable] = {
+    "generate_image": handle_generate_image,
+    "send_video": handle_send_video,
+    "send_audio": handle_send_audio,
+    "send_location": handle_send_location,
+    "send_trace": handle_send_trace,
+    "send_buttons": handle_send_buttons,
+    "send_card_list": handle_send_card_list,
+    "track_usage": handle_track_usage,
+}
+
+
+async def execute_function_call(function_call: dict, session):
+    fn_name = function_call["function"]["name"]
+    logger.info(f"🔧 Processing function: {fn_name}")
+    session.stream(f"\n⚙️ **Processing function:** {fn_name}\n")
+
+    handler = FUNCTION_HANDLERS.get(fn_name)
+    if not handler:
+        return f"\n❌ Unknown function: {fn_name}", None
+
+    return await handler(function_call, session)
+
+
+# =========================
+# Public API
+# =========================
 
 def get_available_functions() -> list:
-    """
-    Get the list of available functions for OpenAI.
-    
-    Returns:
-        list: List of function schemas
-    """
     return AVAILABLE_FUNCTIONS
 
-async def process_function_calls(
-    function_calls: list, 
-    lexia_handler, 
-    data
-) -> tuple[str, str]:
-    """
-    Process a list of function calls and return the combined result.
-    
-    Args:
-        function_calls: List of function call objects from OpenAI
-        lexia_handler: The Lexia handler instance for streaming updates
-        data: The original chat message data
-        
-    Returns:
-        tuple: (combined_result_message, generated_file_url or None)
-    """
+
+async def process_function_calls(function_calls: list, session):
     if not function_calls:
-        logger.info("🔧 No function calls to process")
         return "", None
-    
-    logger.info(f"🔧 Processing {len(function_calls)} function calls...")
-    logger.info(f"🔧 Function calls details: {function_calls}")
-    
-    combined_result = ""
-    generated_file_url = None
-    
-    for function_call in function_calls:
-        try:
-            result, file_url = await execute_function_call(function_call, lexia_handler, data)
-            combined_result += result
-            
-            if file_url and not generated_file_url:
-                generated_file_url = file_url
-                
-        except Exception as e:
-            error_msg = f"Error processing function call: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            combined_result += f"\n\n❌ **Function Processing Error:** {error_msg}"
-    
-    return combined_result, generated_file_url
+
+    output = ""
+    file_url: Optional[str] = None
+
+    for fc in function_calls:
+        result, url = await execute_function_call(fc, session)
+        output += result
+        file_url = file_url or url
+
+    return output, file_url

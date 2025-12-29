@@ -1,31 +1,16 @@
-"""
-Simple AI Agent with Chat Completion
-===================================
-
-A minimal AI agent that demonstrates basic chat completion functionality
-using the Lexia platform with streaming support.
-
-Key Features:
-- Simple chat completion using OpenAI
-- Real-time response streaming via Lexia
-- Basic conversation memory
-- Clean, minimal implementation
-
-Usage:
-    python main.py
-
-The server will start on http://localhost:8000 with the following endpoints:
-- POST /api/v1/send_message - Main chat endpoint
-- GET /api/v1/health - Health check
-- GET /api/v1/ - Root information
-- GET /api/v1/docs - Interactive API documentation
-
-Author: Lexia Team
-License: MIT
-"""
-
+# 1. Environment & Logging Setup (Must be first)
+import os
 import logging
-from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables (allows user override in .env)
+load_dotenv()
+
+# Force DEV mode if not explicitly set to 'false' (prevents production hangs)
+# We do this BEFORE importing orca to ensure the factory picks it up.
+dev_mode_val = os.environ.get("ORCA_DEV_MODE", "true").lower()
+is_dev_mode = dev_mode_val == "true"
+# os.environ["ORCA_DEV_MODE"] = "true" if is_dev_mode else "false"
 
 # Configure logging
 logging.basicConfig(
@@ -34,195 +19,144 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import Lexia components
-from lexia import (
-    LexiaHandler, 
+# 2. Orca & AI Imports
+import asyncio
+from openai import AsyncOpenAI
+from orca import (
+    OrcaHandler, 
     ChatMessage, 
     Variables,
-    create_lexia_app,
-    add_standard_endpoints
+    create_agent_app,
+    SessionContext
 )
-
-# Import function handler for image generation
 from function_handler import get_available_functions, process_function_calls
 
 # Simple conversation memory (in-memory)
 conversation_memory = {}
 
-# Initialize Lexia handler
-lexia = LexiaHandler()
-
-# Create the FastAPI app
-app = create_lexia_app(
-    title="Simple AI Agent",
-    version="1.0.0",
-    description="A simple AI agent with chat completion functionality"
-)
+# Global components
+orca_handler_instance = None
 
 async def process_message(data: ChatMessage) -> None:
     """
-    Process incoming chat messages using OpenAI and send responses via Lexia.
-    
-    This is a simplified version that focuses on basic chat completion
-    with streaming support.
-    
-    Args:
-        data: ChatMessage object containing the incoming message and metadata
+    Core logic for processing incoming messages.
+    Uses SessionContext to manage the agent's interaction with the Orca platform.
     """
-    try:
-        logger.info(f"🚀 Processing message for thread {data.thread_id}")
-        logger.info(f"📝 Message: {data.message[:100]}...")
-        
-        # Get OpenAI API key
-        vars = Variables(data.variables)
-        openai_api_key = vars.get("OPENAI_API_KEY")
-        if not openai_api_key:
-            error_msg = "Sorry, the OpenAI API key is missing. Please configure it in the agent settings."
-            logger.error("OpenAI API key not found")
-            lexia.stream_chunk(data, error_msg)
-            lexia.complete_response(data, error_msg)
-            return
-        
-        # Initialize OpenAI client
-        client = OpenAI(api_key=openai_api_key)
-        
-        # Get conversation history for this thread
-        thread_id = data.thread_id
-        if thread_id not in conversation_memory:
-            conversation_memory[thread_id] = []
-        
-        # Add user message to memory
-        conversation_memory[thread_id].append({"role": "user", "content": data.message})
-        
-        # Prepare messages for OpenAI
-        messages = [
-            {"role": "system", "content": "You are a helpful AI assistant. You can generate dummy images for testing when users ask for images. Use the generate_image function to return a demo image URL based on user descriptions."}
-        ]
-        
-        # Add conversation history (keep last 10 messages)
-        history = conversation_memory[thread_id][-10:]
-        for msg in history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        logger.info(f"🤖 Sending to OpenAI model: {data.model}")
-        
-        # Get available functions from function handler
-        available_functions = get_available_functions()
-        
-        # Stream response from OpenAI with function calling support
-        stream = client.chat.completions.create(
-            model=data.model,
-            messages=messages,
-            tools=available_functions,
-            tool_choice="auto",
-            max_tokens=1000,
-            temperature=0.7,
-            stream=True
-        )
-        
-        # Process streaming response
-        full_response = ""
-        usage_info = None
-        function_calls = []
-        generated_image_url = None
-        
-        logger.info("📡 Streaming response from OpenAI...")
-        
-        for chunk in stream:
-            # Handle content chunks
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_response += content
-                # Stream chunk to Lexia
-                lexia.stream_chunk(data, content)
+    global orca_handler_instance
+    
+    # Ensure we use the global handler or fallback to a safe default
+    handler = orca_handler_instance or OrcaHandler(dev_mode=True)
+    
+    # Use SessionContext as a context manager for automatic setup/teardown
+    with SessionContext(handler, data) as session:
+        try:
+            logger.info(f"🚀 Processing message for thread {data.thread_id}")
             
-            # Handle function call chunks
-            if chunk.choices[0].delta.tool_calls:
-                logger.info(f"🔧 Tool call chunk detected: {chunk.choices[0].delta.tool_calls}")
-                for tool_call in chunk.choices[0].delta.tool_calls:
-                    if tool_call.function:
-                        # Initialize function call if it's new
-                        if len(function_calls) <= tool_call.index:
-                            function_calls.append({
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": ""
-                                }
-                            })
-                            logger.info(f"🔧 New function call initialized: {tool_call.function.name}")
-                            
-                            # Stream function call announcement to Lexia
-                            function_msg = f"\n🔧 **Calling function:** {tool_call.function.name}"
-                            lexia.stream_chunk(data, function_msg)
-                        
-                        # Accumulate function arguments
-                        if tool_call.function.arguments:
-                            function_calls[tool_call.index]["function"]["arguments"] += tool_call.function.arguments
-                            logger.info(f"🔧 Accumulated arguments for function {tool_call.index}: {tool_call.function.arguments}")
+            # Variables & Authentication
+            vars = Variables(data.variables)
+            # Strategy: Variables from request have precedence over environment
+            api_key = vars.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
             
-            # Capture usage information
-            if chunk.usage:
-                usage_info = chunk.usage
-                logger.info(f"📊 Usage info: {usage_info}")
-        
-        logger.info(f"✅ OpenAI response complete. Length: {len(full_response)} characters")
-        
-        # Process function calls if any were made using the function handler
-        function_result, generated_image_url = await process_function_calls(function_calls, lexia, data)
-        if function_result:
-            full_response += function_result
-        
-        logger.info(f"🖼️ Final generated_image_url value: {generated_image_url}")
-        
-        # Add assistant response to memory
-        conversation_memory[thread_id].append({"role": "assistant", "content": full_response})
-        
-        # Send complete response to Lexia with full data structure
-        logger.info("📤 Sending complete response to Lexia...")
-        
-        # Include generated image in the response if one was created
-        if generated_image_url:
-            logger.info(f"🖼️ Including generated image in API call: {generated_image_url}")
-            # Use the complete_response method that includes the file field
-            lexia.complete_response(data, full_response, usage_info, file_url=generated_image_url)
-        else:
-            # Normal response without image
-            lexia.complete_response(data, full_response, usage_info)
-        
-        logger.info(f"🎉 Message processing completed for thread {data.thread_id}")
-            
-    except Exception as e:
-        error_msg = f"Error processing message: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        lexia.send_error(data, error_msg)
+            if not api_key:
+                logger.error("❌ OpenAI API key is missing in both variables and environment.")
+                return session.error("OpenAI API key missing.")
 
-# Add standard Lexia endpoints
-add_standard_endpoints(
-    app, 
-    conversation_manager=None,  # Using simple in-memory storage
-    lexia_handler=lexia,
-    process_message_func=process_message
+            # AsyncOpenAI is preferred for non-blocking IO in FastAPI
+            async with AsyncOpenAI(api_key=api_key) as client:
+                # Thread Identity & context
+                thread_id = data.thread_id
+                if thread_id not in conversation_memory:
+                    conversation_memory[thread_id] = []
+                
+                # Append user message to local history
+                conversation_memory[thread_id].append({"role": "user", "content": data.message})
+                
+                # Prepare message history for LLM (limited to last 10 messages)
+                messages = [
+                    {
+                        "role": "system", 
+                        "content": (
+                            "You are a helpful AI assistant. Use the available tools to provide a rich UI experience: "
+                            "generate_image for images, send_video for videos, send_audio for audio, send_location for maps, "
+                            "send_trace for debugging, send_buttons for interaction, send_card_list for lists, "
+                            "and track_usage for token tracking."
+                        )
+                    }
+                ]
+                messages.extend(conversation_memory[thread_id][-10:])
+                session.loading.start("thinking")
+                # Initiate Streaming Chat Completion
+                # session.loading.start("thinking")
+                stream = await client.chat.completions.create(
+                    model=data.model or "gpt-4o",
+                    messages=messages,
+                    tools=get_available_functions(),
+                    stream=True
+                )
+                
+                full_response = ""
+                function_calls = []
+                loading_ended = False
+                
+                # Process the stream asynchronously
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                        
+                    delta = chunk.choices[0].delta
+                    
+                    # Handle text content
+                    if delta.content:
+                        content = delta.content
+                        full_response += content
+                        session.stream(content)
+                    
+                    # Handle function calling deltas
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            if tc.function:
+                                if len(function_calls) <= tc.index:
+                                    # Start of a new function call
+                                    function_calls.append({
+                                        "id": tc.id, 
+                                        "function": {"name": tc.function.name, "arguments": ""}
+                                    })
+                                    session.stream(f"\n🔧 **Calling:** {tc.function.name}")
+                                # Accumulate JSON arguments
+                                if tc.function.arguments:
+                                    function_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+
+                # # Finalize any pending loading states
+                # session.loading.end("thinking")
+                
+                # Execute planned tool calls
+                if function_calls:
+                    # Small "finalizing" state before tools
+                    await asyncio.sleep(1) # Visibility delay
+                    fn_res, _ = await process_function_calls(function_calls, session)
+                    full_response += (fn_res or "")
+                
+                # Save assistant response to history
+                conversation_memory[thread_id].append({"role": "assistant", "content": full_response})
+            
+        except Exception as e:
+            logger.error(f"❌ Error in process_message: {e}", exc_info=True)
+            # Report error back to the Orca session
+            session.error(f"Execution Error: {str(e)}")
+
+# Initialize the FAST API application with Orca factory
+app, orca_handler_instance = create_agent_app(
+    process_message_func=process_message,
+    title="Dummy Orca Agent",
+    description="A simple AI agent with advanced UI capabilities and Orca SDK integration",
+    version="1.0.4"
 )
+
+# # Overwrite handler dev_mode to sync with our detection
+# if orca_handler_instance:
+#     orca_handler_instance.dev_mode = is_dev_mode
 
 if __name__ == "__main__":
     import uvicorn
-    
-    print("🚀 Starting Simple AI Agent...")
-    print("=" * 50)
-    print("📖 API Documentation: http://localhost:8000/docs")
-    print("🔍 Health Check: http://localhost:8000/api/v1/health")
-    print("💬 Chat Endpoint: http://localhost:8000/api/v1/send_message")
-    print("=" * 50)
-    print("\n✨ This simple agent demonstrates:")
-    print("   - Basic chat completion with OpenAI")
-    print("   - Dummy image generation via function calling")
-    print("   - Real-time streaming via Lexia")
-    print("   - Simple conversation memory")
-    print("   - Clean, minimal implementation")
-    print("\n🔧 Perfect for testing Lexia functionality!")
-    print("=" * 50)
-    
-    # Start the FastAPI server
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info(f"🚀 Starting Orca Agent (is_dev_mode={is_dev_mode})...")
+    uvicorn.run(app, host="0.0.0.0", port=5001)
