@@ -1,5 +1,6 @@
-orcapt-sdk>=1.0.4
+orcapt-sdk>=1.0.5
 openai==1.109.1
 fastapi==0.117.1
 mangum>=0.17.0
 boto3>=1.34.0
+python-dotenv==1.0.1
