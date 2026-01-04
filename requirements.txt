@@ -1,7 +1,7 @@
 fastapi==0.117.1
 uvicorn==0.37.0
 openai==1.109.1
-orcapt-sdk>=1.0.6
+orcapt-sdk>=1.0.7
 httpx==0.28.1
 pydantic==2.11.9
 fastapi[standard]
