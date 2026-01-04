@@ -1,4 +1,4 @@
-orcapt-sdk>=1.0.5
+orcapt-sdk>=1.0.6
 openai==1.109.1
 fastapi==0.117.1
 mangum>=0.17.0

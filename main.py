@@ -1,10 +1,12 @@
 # 1. Environment & Logging Setup (Must be first)
 import os
 import logging
-from dotenv import load_dotenv
-
-# Load environment variables (allows user override in .env)
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # dotenv is not installed or not needed in this environment (e.g. Lambda with pre-configured env vars)
+    pass
 
 # Force DEV mode if not explicitly set to 'false' (prevents production hangs)
 # We do this BEFORE importing orca to ensure the factory picks it up.
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 # 2. Orca & AI Imports
 import asyncio
 from openai import AsyncOpenAI
+from httpx import Timeout
 from orca import (
     OrcaHandler, 
     ChatMessage, 
@@ -62,7 +65,9 @@ async def process_message(data: ChatMessage) -> None:
                 return session.error("OpenAI API key missing.")
 
             # AsyncOpenAI is preferred for non-blocking IO in FastAPI
-            async with AsyncOpenAI(api_key=api_key) as client:
+            # Configure timeout to prevent hanging requests (60s connect, 300s read/write)
+            timeout = Timeout(60.0, connect=30.0, read=300.0, write=300.0, pool=30.0)
+            async with AsyncOpenAI(api_key=api_key, timeout=timeout) as client:
                 # Thread Identity & context
                 thread_id = data.thread_id
                 if thread_id not in conversation_memory:
@@ -85,59 +90,60 @@ async def process_message(data: ChatMessage) -> None:
                 ]
                 messages.extend(conversation_memory[thread_id][-10:])
                 session.loading.start("thinking")
-                # Initiate Streaming Chat Completion
-                # session.loading.start("thinking")
-                stream = await client.chat.completions.create(
-                    model=data.model or "gpt-4o",
-                    messages=messages,
-                    tools=get_available_functions(),
-                    stream=True
-                )
                 
-                full_response = ""
-                function_calls = []
-                loading_ended = False
-                
-                # Process the stream asynchronously
-                async for chunk in stream:
-                    if not chunk.choices:
-                        continue
+                try:
+                    # Initiate Streaming Chat Completion
+                    stream = await client.chat.completions.create(
+                        model=data.model or "gpt-4o",
+                        messages=messages,
+                        tools=get_available_functions(),
+                        stream=True
+                    )
+                    
+                    full_response = ""
+                    function_calls = []
+                    
+                    # Process the stream asynchronously
+                    async for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                            
+                        delta = chunk.choices[0].delta
                         
-                    delta = chunk.choices[0].delta
-                    
-                    # Handle text content
-                    if delta.content:
-                        content = delta.content
-                        full_response += content
-                        session.stream(content)
-                    
-                    # Handle function calling deltas
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            if tc.function:
-                                if len(function_calls) <= tc.index:
-                                    # Start of a new function call
-                                    function_calls.append({
-                                        "id": tc.id, 
-                                        "function": {"name": tc.function.name, "arguments": ""}
-                                    })
-                                    session.stream(f"\n🔧 **Calling:** {tc.function.name}")
-                                # Accumulate JSON arguments
-                                if tc.function.arguments:
-                                    function_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+                        # Handle text content
+                        if delta.content:
+                            content = delta.content
+                            full_response += content
+                            session.stream(content)
+                        
+                        # Handle function calling deltas
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                if tc.function:
+                                    if len(function_calls) <= tc.index:
+                                        # Start of a new function call
+                                        function_calls.append({
+                                            "id": tc.id, 
+                                            "function": {"name": tc.function.name, "arguments": ""}
+                                        })
+                                        session.stream(f"\n🔧 **Calling:** {tc.function.name}")
+                                    # Accumulate JSON arguments
+                                    if tc.function.arguments:
+                                        function_calls[tc.index]["function"]["arguments"] += tc.function.arguments
 
-                # # Finalize any pending loading states
-                # session.loading.end("thinking")
-                
-                # Execute planned tool calls
-                if function_calls:
-                    # Small "finalizing" state before tools
-                    await asyncio.sleep(1) # Visibility delay
-                    fn_res, _ = await process_function_calls(function_calls, session)
-                    full_response += (fn_res or "")
-                
-                # Save assistant response to history
-                conversation_memory[thread_id].append({"role": "assistant", "content": full_response})
+                    # Execute planned tool calls
+                    if function_calls:
+                        # Small "finalizing" state before tools
+                        await asyncio.sleep(1) # Visibility delay
+                        fn_res, _ = await process_function_calls(function_calls, session)
+                        full_response += (fn_res or "")
+                    
+                    # Save assistant response to history
+                    conversation_memory[thread_id].append({"role": "assistant", "content": full_response})
+                    
+                finally:
+                    # Always stop loading, even if error occurs
+                    session.loading.end("thinking")
             
         except Exception as e:
             logger.error(f"❌ Error in process_message: {e}", exc_info=True)
